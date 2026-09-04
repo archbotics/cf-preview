@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Test stub for the few git calls cf-preview makes. Records the argument list.
+# A detached worktree is faked by copying $CF_PREVIEW_TEST_WORKTREE_SRC.
+set -euo pipefail
+printf 'git %s\n' "$*" >>"$CF_PREVIEW_TEST_LOG"
+
+if [ "${1:-}" = "-C" ]; then
+  shift 2
+fi
+
+case "${1:-}" in
+  rev-parse)
+    shift
+    case "$*" in
+      *--show-toplevel*) printf '%s\n' "${CF_PREVIEW_TEST_REPO:-/nonexistent}" ;;
+      *"${CF_PREVIEW_TEST_REF:-__no_ref__}"*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  worktree)
+    case "${2:-}" in
+      add)
+        # git worktree add --detach --quiet <path> <ref>
+        target=""
+        for arg in "$@"; do
+          case "$arg" in
+            -*|worktree|add) ;;
+            *) [ -n "$target" ] || target="$arg" ;;
+          esac
+        done
+        mkdir -p "$target"
+        cp -a "$CF_PREVIEW_TEST_WORKTREE_SRC/." "$target/"
+        ;;
+      remove) rm -rf "${4:?worktree remove needs a path}" ;;
+      prune) ;;
+    esac
+    ;;
+esac
+exit 0

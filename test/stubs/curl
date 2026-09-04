@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Test stub for the Cloudflare REST API. Records the argument list and answers
+# from a canned table keyed on the request, so tests never reach a network.
+set -euo pipefail
+printf 'curl %s\n' "$*" >>"$CF_PREVIEW_TEST_LOG"
+
+# The real tool passes credentials as a curl config on stdin, never in argv.
+# Drain it and record only whether an auth header arrived: logging the value
+# would put the token back into a file the assertions read.
+case " $* " in
+  *" --config "*)
+    config=$(cat)
+    case "$config" in
+      *'Authorization: Bearer '?*) printf 'curl-stdin: auth header present\n' >>"$CF_PREVIEW_TEST_LOG" ;;
+      *) printf 'curl-stdin: NO auth header\n' >>"$CF_PREVIEW_TEST_LOG" ;;
+    esac
+    ;;
+esac
+
+method="GET"
+url=""
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    -X) method="$arg" ;;
+  esac
+  case "$arg" in
+    https://*) url="$arg" ;;
+  esac
+  prev="$arg"
+done
+
+if [ "$method" = "DELETE" ]; then
+  printf '{"success": true, "errors": [], "messages": [], "result": null}'
+  exit 0
+fi
+
+case "$url" in
+  */workers/subdomain)
+    printf '{"success": true, "errors": [], "result": {"subdomain": "teststub"}}'
+    ;;
+  */workers/scripts)
+    cat <<'JSON'
+{"success": true, "errors": [], "result": [
+  {"id": "preview-demo", "modified_on": "2026-01-02T03:04:05Z"},
+  {"id": "preview-other", "modified_on": "2026-01-03T03:04:05Z"},
+  {"id": "production-api", "modified_on": "2026-01-04T03:04:05Z"},
+  {"id": "staging-preview-demo", "modified_on": "2026-01-05T03:04:05Z"}
+]}
+JSON
+    ;;
+  *)
+    printf '{"success": false, "errors": [{"message": "stub has no answer for %s"}]}' "$url"
+    ;;
+esac

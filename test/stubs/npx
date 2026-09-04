@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test stub. Records the argument list and succeeds without touching a network.
+set -euo pipefail
+printf 'npx %s\n' "$*" >>"$CF_PREVIEW_TEST_LOG"
+exit 0

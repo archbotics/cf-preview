@@ -1,0 +1,662 @@
+#!/usr/bin/env bash
+#
+# Copyright 2026 Archbotics Oy
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# cf-preview: throwaway, non-indexable preview deploys of a static site on
+# Cloudflare Workers (*.workers.dev), so a non-technical approver can look at a
+# change in a browser before it goes live.
+#
+#   cf-preview deploy <dir-or-git-ref> --name <slug> [options]
+#   cf-preview list [--prefix <prefix>]
+#   cf-preview delete <slug> [--prefix <prefix>]
+#   cf-preview url <slug> [--prefix <prefix>]
+#
+# Design notes (why, not just what):
+# - A git ref is built in a DETACHED WORKTREE, never in the working tree, so an
+#   in-flight edit cannot leak into something an approver signs off on.
+# - Hardening is applied to a COPY of the build output. The source directory is
+#   never modified: robots.txt and _headers land in the copy, CNAME is dropped
+#   from the copy. A public preview must not compete with the real site in
+#   search results, and must not claim the real site's hostname.
+# - Only the asset upload goes through wrangler. Listing and deletion use the
+#   Cloudflare REST API directly, which is deterministic and non-interactive.
+# - Credentials are read from the environment and never written anywhere.
+set -euo pipefail
+
+VERSION="0.1.0"
+API="https://api.cloudflare.com/client/v4"
+DEFAULT_PREFIX="preview"
+# Kept deliberately old: every wrangler release in use today supports it, and
+# nothing here depends on newer runtime behaviour. Override with --compat-date.
+DEFAULT_COMPAT_DATE="2025-01-01"
+# Worker names may be longer than this; staying under the limit leaves room for
+# the disambiguating hash appended to over-long names.
+NAME_MAX=54
+# The path shown by --dry-run in place of the real mktemp -d result.
+DRY_RUN_WORKDIR="/tmp/cf-preview.XXXXXXXX"
+
+DRY_RUN=0
+# Cleanup state. Globals, not locals: the EXIT trap must see them no matter
+# which function the script exits from.
+CLEAN_TMP=""
+CLEAN_REPO=""
+CLEAN_WORKTREE=""
+CLEAN_KEEP=0
+
+usage() {
+  cat <<'EOF'
+cf-preview: throwaway, non-indexable static-site previews on Cloudflare Workers
+
+Usage:
+  cf-preview deploy <dir-or-git-ref> --name <slug> [options]
+  cf-preview list [--prefix <prefix>]
+  cf-preview delete <slug> [--prefix <prefix>]
+  cf-preview url <slug> [--prefix <prefix>]
+  cf-preview --help | --version
+
+deploy options:
+  --name <slug>       Required. Preview identity; the worker is <prefix>-<slug>.
+  --build "<cmd>"     Shell command that builds the site. Run in the worktree
+                      (git ref mode) or in the given directory (directory mode).
+  --output <dir>      Directory to deploy, relative to the build root.
+                      Default: the build root itself.
+  --prefix <prefix>   Worker name prefix. Default: preview
+  --repo <path>       Repository to resolve a git ref in. Default: the
+                      repository containing the current directory.
+  --no-worktree       Git ref mode only: build in the repository working tree
+                      instead of a detached worktree. Deploys what is on disk,
+                      including uncommitted changes.
+  --header-worker     Serve assets through a small worker that sets
+                      X-Robots-Tag, instead of relying on the _headers file.
+  --compat-date <d>   Worker compatibility date. Default: 2025-01-01
+  --subdomain <sub>   Your workers.dev subdomain, without ".workers.dev".
+                      Default: $CF_WORKERS_SUBDOMAIN, else looked up via the API.
+  --keep-temp         Do not delete the working directory; print its path.
+  --dry-run           Print the commands and generated files, change nothing.
+
+list / delete / url options:
+  --prefix <prefix>   Worker name prefix. Default: preview
+  --subdomain <sub>   As above (list and url).
+  --dry-run           Print the API request instead of sending it.
+
+Environment:
+  CLOUDFLARE_API_TOKEN   Required for deploy, list, delete (never stored).
+  CLOUDFLARE_ACCOUNT_ID  Required for deploy, list, delete.
+  CF_WORKERS_SUBDOMAIN   Optional; skips the subdomain lookup.
+
+A positional argument that is an existing directory is deployed as is;
+anything else is treated as a git ref.
+EOF
+}
+
+die() { printf 'cf-preview: %s\n' "$*" >&2; exit 1; }
+note() { printf 'cf-preview: %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Print the command under --dry-run, run it otherwise.
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+    return 0
+  fi
+  "$@"
+}
+
+# Write stdin to $1. Under --dry-run, show what would be written instead.
+write_file() {
+  local path="$1" content
+  content=$(cat)
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ write %s\n' "$path"
+    printf '%s\n' "$content" | sed 's/^/  | /'
+    return 0
+  fi
+  printf '%s\n' "$content" >"$path"
+}
+
+# Append stdin to $1, creating it if needed. Same dry-run behaviour.
+append_file() {
+  local path="$1" content
+  content=$(cat)
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ append %s\n' "$path"
+    printf '%s\n' "$content" | sed 's/^/  | /'
+    return 0
+  fi
+  printf '%s\n' "$content" >>"$path"
+}
+
+require_creds() {
+  [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || die "CLOUDFLARE_API_TOKEN is not set"
+  [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "CLOUDFLARE_ACCOUNT_ID is not set"
+}
+
+# Checked up front, in the caller's shell: the JSON helpers below run inside
+# command substitutions, where an exit would only kill the subshell.
+require_json() {
+  have jq || have python3 \
+    || die "need jq or python3 to read Cloudflare API responses"
+}
+
+# --- naming ------------------------------------------------------------------
+
+# First 8 hex characters of the sha256 of $1. GNU systems have sha256sum;
+# macOS has shasum. Refusing beats returning an empty string, which would let
+# two different long names collide onto one worker.
+hash_of() {
+  local out=""
+  if have sha256sum; then
+    out=$(printf '%s' "$1" | sha256sum | cut -c1-8)
+  elif have shasum; then
+    out=$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)
+  else
+    die "need sha256sum or shasum to shorten a name longer than $NAME_MAX characters"
+  fi
+  [ -n "$out" ] || die "failed to hash the name"
+  printf '%s' "$out"
+}
+
+# <prefix>-<slug>, lowercased, non-alphanumerics collapsed to hyphens. Names
+# over the length cap keep a hash of the original slug, so two long slugs that
+# share a prefix cannot collide onto one worker.
+worker_name() {
+  local prefix="$1" raw="$2" slug name hash
+  slug=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+  [ -n "$slug" ] || die "--name must contain at least one letter or digit"
+  name="$prefix-$slug"
+  if [ "${#name}" -gt "$NAME_MAX" ]; then
+    hash=$(hash_of "$raw")
+    [ -n "$hash" ] || die "failed to hash the name"
+    name="${name:0:$((NAME_MAX - 9))}-$hash"
+  fi
+  printf '%s' "$name"
+}
+
+check_prefix() {
+  case "$1" in
+    [a-z]*) ;;
+    *) die "--prefix must start with a lowercase letter: $1" ;;
+  esac
+  case "$1" in
+    *[!a-z0-9-]*) die "--prefix may only contain a-z, 0-9 and hyphens: $1" ;;
+  esac
+}
+
+# --- JSON --------------------------------------------------------------------
+# jq if present, python3 otherwise. Both are common on developer machines; the
+# tool refuses rather than guessing with a regex if neither is available.
+
+# Read a dotted path out of the JSON on stdin. Prints nothing if absent.
+json_value() {
+  if have jq; then
+    jq -r --arg p "$1" 'getpath($p | split(".")) // empty'
+  elif have python3; then
+    python3 -c '
+import json, sys
+try:
+    v = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for key in sys.argv[1].split("."):
+    if not isinstance(v, dict) or key not in v:
+        sys.exit(0)
+    v = v[key]
+if isinstance(v, bool):
+    print("true" if v else "false")
+elif v is not None:
+    print(v)
+' "$1"
+  else
+    note "need jq or python3 to read Cloudflare API responses"
+    return 1
+  fi
+}
+
+# Read the script list on stdin as "id<TAB>modified_on" lines.
+json_scripts() {
+  if have jq; then
+    jq -r '.result[]? | [.id, (.modified_on // "?")] | @tsv'
+  elif have python3; then
+    python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for s in doc.get("result") or []:
+    print("%s\t%s" % (s.get("id", ""), s.get("modified_on", "?")))
+'
+  else
+    note "need jq or python3 to read Cloudflare API responses"
+    return 1
+  fi
+}
+
+# --- Cloudflare API ----------------------------------------------------------
+
+api() {
+  local method="$1" path="$2" body
+  # The Authorization header goes in over stdin as a curl config, never in
+  # argv: on Linux every process on the machine can read another process's
+  # argv out of /proc, and a token in a command line also lands in shell
+  # history and in `ps` output.
+  body=$(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" \
+    | curl -sS --config - -X "$method" "$API$path" \
+      -H "Content-Type: application/json") || die "API request failed: $method $path"
+  printf '%s' "$body"
+}
+
+api_command_line() {
+  # Shown by --dry-run: the real command shape, with the token left as an
+  # unexpanded variable name, so dry-run output is safe to paste anywhere.
+  printf "+ printf 'header = \"Authorization: Bearer \$CLOUDFLARE_API_TOKEN\"' | curl -sS --config - -X %s %s%s\n" \
+    "$1" "$API" "$2"
+}
+
+api_check() {
+  local body="$1" what="$2" ok errs
+  ok=$(printf '%s' "$body" | json_value success)
+  if [ "$ok" != "true" ]; then
+    errs=$(printf '%s' "$body" | tr -d '\n' | cut -c1-500)
+    die "$what failed: $errs"
+  fi
+}
+
+resolve_subdomain() {
+  local given="$1" body sub
+  if [ -n "$given" ]; then printf '%s' "$given"; return 0; fi
+  if [ -n "${CF_WORKERS_SUBDOMAIN:-}" ]; then printf '%s' "$CF_WORKERS_SUBDOMAIN"; return 0; fi
+  body=$(api GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain")
+  api_check "$body" "workers.dev subdomain lookup"
+  sub=$(printf '%s' "$body" | json_value result.subdomain)
+  [ -n "$sub" ] || die "account has no workers.dev subdomain; register one in the Cloudflare dashboard"
+  printf '%s' "$sub"
+}
+
+preview_url() { printf 'https://%s.%s.workers.dev/' "$1" "$2"; }
+
+# --- generated files ---------------------------------------------------------
+
+# Everything at the top of the copy whose name begins with a dot is removed,
+# and so is every top-level symlink. A built static site has no business
+# carrying either, but a directory handed over unbuilt (a repository root, a
+# scratch folder, a home directory) is full of them, and .git, .env, .npmrc,
+# .netrc and .ssh on a public URL are each an incident on their own. A symlink
+# is dropped rather than followed: following one would copy the file it points
+# at, which is how /etc/passwd ends up published.
+#
+# .well-known survives, because it is a real part of a served site.
+#
+# Names are decided from the source listing so that --dry-run can report the
+# same set without having made the copy yet.
+sweep_copy() {
+  local src="$1" site="$2" entry base dotted="" linked=""
+  for entry in "$src"/.*; do
+    base=${entry##*/}
+    case "$base" in
+      .|..|.well-known) continue ;;
+    esac
+    if [ -e "$entry" ] || [ -L "$entry" ]; then
+      dotted="$dotted $base"
+      run rm -rf "$site/$base"
+    fi
+  done
+  for entry in "$src"/*; do
+    if [ -L "$entry" ]; then
+      base=${entry##*/}
+      linked="$linked $base"
+      run rm -f "$site/$base"
+    fi
+  done
+  [ -z "$dotted" ] || note "dotfiles kept out of the preview:$dotted"
+  [ -z "$linked" ] || note "symlinks kept out of the preview:$linked"
+}
+
+write_hardening() {
+  local src="$1" site="$2"
+  # Belt: crawlers that read robots.txt never fetch the pages.
+  write_file "$site/robots.txt" <<'EOF'
+User-agent: *
+Disallow: /
+EOF
+  # Braces: a crawler that fetches anyway still gets a noindex header. A site
+  # that ships its own _headers keeps them, or the preview would render under
+  # different rules than production and defeat the point of previewing it.
+  if [ -f "$src/_headers" ]; then
+    note "the site ships its own _headers; appending the noindex rule to the copy"
+    append_file "$site/_headers" <<'EOF'
+
+/*
+  X-Robots-Tag: noindex, nofollow
+EOF
+  else
+    write_file "$site/_headers" <<'EOF'
+/*
+  X-Robots-Tag: noindex, nofollow
+EOF
+  fi
+  # A CNAME file would point a custom domain at the real site's hostname.
+  run rm -f "$site/CNAME"
+  sweep_copy "$src" "$site"
+}
+
+write_worker() {
+  write_file "$1" <<'EOF'
+// Serves the static assets and stamps every response as non-indexable.
+export default {
+  async fetch(request, env) {
+    const response = await env.ASSETS.fetch(request);
+    const headers = new Headers(response.headers);
+    headers.set("X-Robots-Tag", "noindex, nofollow");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  },
+};
+EOF
+}
+
+write_wrangler_toml() {
+  local path="$1" name="$2" compat="$3" header_worker="$4"
+  if [ "$header_worker" -eq 1 ]; then
+    write_file "$path" <<EOF
+# Generated by cf-preview $VERSION. Temporary; not part of your repository.
+name = "$name"
+main = "./worker.js"
+compatibility_date = "$compat"
+workers_dev = true
+
+[assets]
+directory = "./site"
+binding = "ASSETS"
+not_found_handling = "404-page"
+run_worker_first = true
+EOF
+  else
+    write_file "$path" <<EOF
+# Generated by cf-preview $VERSION. Temporary; not part of your repository.
+name = "$name"
+compatibility_date = "$compat"
+workers_dev = true
+
+[assets]
+directory = "./site"
+not_found_handling = "404-page"
+EOF
+  fi
+}
+
+# --- deploy ------------------------------------------------------------------
+
+cleanup() {
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if [ -n "$CLEAN_WORKTREE" ] && [ -n "$CLEAN_REPO" ]; then
+    git -C "$CLEAN_REPO" worktree remove --force "$CLEAN_WORKTREE" >/dev/null 2>&1 || true
+    git -C "$CLEAN_REPO" worktree prune >/dev/null 2>&1 || true
+  fi
+  if [ -n "$CLEAN_TMP" ]; then
+    if [ "$CLEAN_KEEP" -eq 1 ]; then
+      note "kept working directory: $CLEAN_TMP"
+    else
+      # ${VAR:?} and not "$VAR": an empty value here would be a recursive
+      # delete of the filesystem root.
+      rm -rf "${CLEAN_TMP:?cleanup has no working directory}"
+    fi
+  fi
+}
+
+cmd_deploy() {
+  local source="" slug="" build="" output="" repo=""
+  local prefix="$DEFAULT_PREFIX" compat="$DEFAULT_COMPAT_DATE" subdomain=""
+  local use_worktree=1 header_worker=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) slug="${2:?--name needs a value}"; shift 2 ;;
+      --build) build="${2:?--build needs a value}"; shift 2 ;;
+      --output) output="${2:?--output needs a value}"; shift 2 ;;
+      --prefix) prefix="${2:?--prefix needs a value}"; shift 2 ;;
+      --repo) repo="${2:?--repo needs a value}"; shift 2 ;;
+      --compat-date) compat="${2:?--compat-date needs a value}"; shift 2 ;;
+      --subdomain) subdomain="${2:?--subdomain needs a value}"; shift 2 ;;
+      --no-worktree) use_worktree=0; shift ;;
+      --header-worker) header_worker=1; shift ;;
+      --keep-temp) CLEAN_KEEP=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option for deploy: $1" ;;
+      *)
+        [ -z "$source" ] || die "deploy takes one directory or git ref, got '$source' and '$1'"
+        source="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$source" ] || die "deploy needs a directory or git ref"
+  [ -n "$slug" ] || die "deploy needs --name <slug>"
+  check_prefix "$prefix"
+  case "$output" in
+    /*) die "--output must be relative to the build root: $output" ;;
+    ..|../*|*/../*|*/..) die "--output may not climb out of the build root: $output" ;;
+  esac
+
+  # Everything the receipt needs is checked before anything is uploaded. These
+  # used to run after the wrangler call, which meant a machine without jq or
+  # python3 published a worker and then died before printing its URL: a live
+  # preview nobody had the address of.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    require_creds
+    if [ -z "$subdomain" ] && [ -z "${CF_WORKERS_SUBDOMAIN:-}" ]; then
+      require_json
+    fi
+  fi
+
+  local name tmp build_root src site url sub
+  name=$(worker_name "$prefix" "$slug")
+
+  # One working directory for everything generated: the detached worktree, the
+  # hardened copy of the site, the wrangler config. Removed on exit.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    tmp="$DRY_RUN_WORKDIR"
+    printf '+ mktemp -d %s\n' "$tmp"
+  else
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/cf-preview.XXXXXXXX")
+  fi
+  CLEAN_TMP="$tmp"
+  trap cleanup EXIT
+
+  if [ -d "$source" ]; then
+    # Directory mode: deploy what is on disk, as is.
+    build_root="${source%/}"
+    if [ "$use_worktree" -eq 0 ]; then
+      note "--no-worktree has no effect when deploying a directory"
+    fi
+  else
+    # Git ref mode.
+    if [ -z "$repo" ]; then
+      repo=$(git rev-parse --show-toplevel 2>/dev/null) \
+        || die "'$source' is not a directory and there is no git repository here; pass --repo <path>"
+    fi
+    git -C "$repo" rev-parse --verify --quiet "$source^{commit}" >/dev/null \
+      || die "'$source' is neither an existing directory nor a git ref in $repo"
+    if [ "$use_worktree" -eq 1 ]; then
+      run git -C "$repo" worktree add --detach --quiet "$tmp/src" "$source"
+      CLEAN_REPO="$repo"
+      CLEAN_WORKTREE="$tmp/src"
+      build_root="$tmp/src"
+    else
+      note "--no-worktree: building the working tree at $repo, not the committed state of $source"
+      build_root="$repo"
+    fi
+  fi
+
+  if [ -n "$build" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf '+ (cd %q && %s)\n' "$build_root" "$build"
+    else
+      ( cd "$build_root" && eval "$build" ) || die "build command failed: $build"
+    fi
+  fi
+
+  src="$build_root"
+  [ -z "$output" ] || src="$build_root/${output#./}"
+  if [ "$DRY_RUN" -eq 0 ] && [ ! -d "$src" ]; then
+    die "nothing to deploy: $src does not exist"
+  fi
+
+  # The hardened copy. The source tree is read, never written.
+  site="$tmp/site"
+  run mkdir -p "$site"
+  run cp -a "$src/." "$site/"
+  write_hardening "$src" "$site"
+  if [ "$header_worker" -eq 1 ]; then
+    write_worker "$tmp/worker.js"
+  fi
+  write_wrangler_toml "$tmp/wrangler.toml" "$name" "$compat" "$header_worker"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    run npx --yes wrangler deploy --config "$tmp/wrangler.toml"
+    url=$(preview_url "$name" "${subdomain:-${CF_WORKERS_SUBDOMAIN:-<subdomain>}}")
+    printf 'dry run: would deploy %s from %s to %s\n' "$name" "$src" "$url"
+    return 0
+  fi
+
+  if ! npx --yes wrangler deploy --config "$tmp/wrangler.toml" >"$tmp/deploy.log" 2>&1; then
+    note "wrangler deploy failed:"
+    tail -20 "$tmp/deploy.log" >&2
+    exit 1
+  fi
+
+  sub=$(resolve_subdomain "$subdomain")
+  url=$(preview_url "$name" "$sub")
+  printf 'deployed: %s  %s  (from %s)\n' "$name" "$url" "$src"
+}
+
+# --- list / delete / url -----------------------------------------------------
+
+cmd_list() {
+  local prefix="$DEFAULT_PREFIX" subdomain="" body sub id modified count=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prefix) prefix="${2:?--prefix needs a value}"; shift 2 ;;
+      --subdomain) subdomain="${2:?--subdomain needs a value}"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown argument for list: $1" ;;
+    esac
+  done
+  check_prefix "$prefix"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    api_command_line GET "/accounts/\$CLOUDFLARE_ACCOUNT_ID/workers/scripts"
+    return 0
+  fi
+
+  require_creds
+  require_json
+  body=$(api GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts")
+  api_check "$body" "worker list"
+  sub=$(resolve_subdomain "$subdomain")
+
+  while IFS=$'\t' read -r id modified; do
+    case "$id" in
+      "$prefix"-*)
+        printf '%s  %s  modified %s\n' "$id" "$(preview_url "$id" "$sub")" "$modified"
+        count=$((count + 1))
+        ;;
+    esac
+  done < <(printf '%s' "$body" | json_scripts)
+
+  [ "$count" -gt 0 ] || note "no workers named $prefix-*"
+}
+
+cmd_delete() {
+  local prefix="$DEFAULT_PREFIX" slug="" name body
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prefix) prefix="${2:?--prefix needs a value}"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option for delete: $1" ;;
+      *)
+        [ -z "$slug" ] || die "delete takes one slug, got '$slug' and '$1'"
+        slug="$1"; shift ;;
+    esac
+  done
+  [ -n "$slug" ] || die "delete needs a slug"
+  check_prefix "$prefix"
+  name=$(worker_name "$prefix" "$slug")
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    api_command_line DELETE "/accounts/\$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$name"
+    return 0
+  fi
+
+  require_creds
+  require_json
+  body=$(api DELETE "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$name")
+  api_check "$body" "delete $name"
+  printf 'deleted: %s\n' "$name"
+}
+
+cmd_url() {
+  local prefix="$DEFAULT_PREFIX" subdomain="" slug="" name sub
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prefix) prefix="${2:?--prefix needs a value}"; shift 2 ;;
+      --subdomain) subdomain="${2:?--subdomain needs a value}"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option for url: $1" ;;
+      *)
+        [ -z "$slug" ] || die "url takes one slug, got '$slug' and '$1'"
+        slug="$1"; shift ;;
+    esac
+  done
+  [ -n "$slug" ] || die "url needs a slug"
+  check_prefix "$prefix"
+  name=$(worker_name "$prefix" "$slug")
+
+  if [ -z "$subdomain" ] && [ -z "${CF_WORKERS_SUBDOMAIN:-}" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf '%s\n' "$(preview_url "$name" "<subdomain>")"
+      return 0
+    fi
+    require_creds
+    require_json
+  fi
+  sub=$(resolve_subdomain "$subdomain")
+  printf '%s\n' "$(preview_url "$name" "$sub")"
+}
+
+main() {
+  local cmd="${1:-}"
+  if [ $# -gt 0 ]; then shift; fi
+  case "$cmd" in
+    deploy) cmd_deploy "$@" ;;
+    list) cmd_list "$@" ;;
+    delete) cmd_delete "$@" ;;
+    url) cmd_url "$@" ;;
+    -h|--help|help) usage ;;
+    --version) printf 'cf-preview %s\n' "$VERSION" ;;
+    "") usage >&2; exit 1 ;;
+    *) printf 'cf-preview: unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"

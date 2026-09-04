@@ -1,0 +1,6 @@
+# cf-preview builds everything it needs in a temporary directory, so a normal
+# run leaves nothing here. These are the usual local strays.
+.DS_Store
+*.log
+node_modules/
+.wrangler/
