@@ -208,4 +208,4 @@ deploy without a Cloudflare account:
 
 ## License
 
-Apache-2.0. Copyright 2026 Archbotics Oy. See `LICENSE`.
+Apache-2.0. Copyright 2026 [Archbotics Oy](https://archbotics.com/). See `LICENSE`.
